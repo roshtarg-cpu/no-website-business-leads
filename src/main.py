@@ -2,13 +2,11 @@
 Main entry point for the No-Website Business Leads actor.
 
 Flow:
-1. Read actor input (searchQuery, location, maxResults, includeWeakWebsite, proxy).
-2. Open Google Maps search page for "[searchQuery] in [location]".
-3. Scroll search results panel to collect listing URLs.
-4. Visit each listing, extract business details.
-5. Filter out businesses that have a real website.
-6. Calculate lead score and accumulate until maxResults reached.
-7. Sort by lead score descending and push to Apify dataset.
+1. Read actor input.
+2. Open Google Maps search page and scroll to collect listing URLs.
+3. Visit listings CONCURRENTLY (up to CONCURRENCY pages at once).
+4. Filter out businesses with real websites.
+5. Calculate lead score, sort, push to dataset.
 """
 
 from __future__ import annotations
@@ -27,16 +25,13 @@ from .utils import (
     classify_website,
 )
 
-MAX_RETRIES = 3
-BETWEEN_REQUESTS_DELAY_MS = 500     # 0.5 s between listing visits (page.goto already takes time)
-PROGRESS_LOG_EVERY = 10             # log progress every N results
+CONCURRENCY = 5          # parallel listing pages open at once
+MAX_RETRIES = 2
+PROGRESS_LOG_EVERY = 10
 
 
-async def _open_search_page(proxy_url: str | None, search_url: str):
-    """
-    Open Camoufox browser, navigate to Google Maps search URL and return
-    (browser_cm, browser, page) so the caller can reuse the same session.
-    """
+async def _open_browser(proxy_url: str | None):
+    """Start Camoufox browser and return (context_manager, browser)."""
     proxy = _parse_proxy(proxy_url)
     browser_cm = AsyncCamoufox(
         headless=True,
@@ -45,36 +40,61 @@ async def _open_search_page(proxy_url: str | None, search_url: str):
         firefox_user_prefs={"security.sandbox.content.level": 0},
     )
     browser = await browser_cm.__aenter__()
+    return browser_cm, browser
+
+
+async def _scroll_search_page(browser, search_url: str, target: int) -> list[str]:
+    """Open search page on a dedicated page, scroll, return listing URLs."""
     page = await browser.new_page()
+    try:
+        await page.goto(search_url, wait_until="load", timeout=60_000)
+        await page.wait_for_timeout(2_000)
+        html = await page.content()
+        Actor.log.info("Search page loaded (%d bytes).", len(html))
+        urls = await get_listing_urls(page, max_scroll_attempts=40, target=target)
+    finally:
+        await page.close()
+    return urls
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            # Use "load" — Google Maps never reaches networkidle due to
-            # continuous background XHRs, which would burn the full timeout.
-            await page.goto(search_url, wait_until="load", timeout=60_000)
-            await page.wait_for_timeout(2_000)
-            html = await page.content()
-            if len(html) > 500:
-                Actor.log.info("Search page loaded (%d bytes).", len(html))
-                return browser_cm, browser, page
-            Actor.log.warning(
-                "Short response on attempt %d/%d (%d bytes).",
-                attempt, MAX_RETRIES, len(html),
-            )
-        except Exception as exc:
-            Actor.log.warning("Attempt %d/%d failed: %s", attempt, MAX_RETRIES, exc)
-        await asyncio.sleep(2)
 
-    raise RuntimeError(f"Could not load Google Maps search after {MAX_RETRIES} attempts.")
+async def _fetch_listing(browser, url: str, semaphore: asyncio.Semaphore) -> dict:
+    """Fetch one listing under the concurrency semaphore, with retries."""
+    async with semaphore:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                details = await extract_business_details(browser, url)
+                return details
+            except Exception as exc:
+                Actor.log.warning("Listing attempt %d/%d failed %s: %s", attempt, MAX_RETRIES, url, exc)
+                await asyncio.sleep(1)
+        return {}
 
 
 def _extract_city_country(location: str) -> tuple[str, str]:
-    """Best-effort split of 'City, Country' or 'City Country'."""
     parts = [p.strip() for p in location.replace(",", " ").split() if p.strip()]
     if len(parts) >= 2:
-        # Last word → country hint, everything else → city
         return " ".join(parts[:-1]), parts[-1]
     return location.strip(), ""
+
+
+def _build_record(details: dict, website_status: str, city: str, country: str) -> dict:
+    record = {
+        "businessName": details["businessName"],
+        "phone": details.get("phone"),
+        "category": details.get("category"),
+        "address": details.get("address"),
+        "city": city,
+        "country": country,
+        "rating": details.get("rating"),
+        "reviewCount": details.get("reviewCount"),
+        "googleMapsUrl": details.get("googleMapsUrl"),
+        "hasPhone": details.get("hasPhone", False),
+        "websiteStatus": website_status,
+        "leadScore": 0,
+        "scrapedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    record["leadScore"] = calculate_lead_score(record)
+    return record
 
 
 async def main() -> None:
@@ -95,120 +115,69 @@ async def main() -> None:
         )
         proxy_url: str | None = await proxy_cfg.new_url() if proxy_cfg else None
         if proxy_url:
-            Actor.log.info("Using proxy: %s", proxy_url.split("@")[-1])  # hide credentials
+            Actor.log.info("Using proxy: %s", proxy_url.split("@")[-1])
         else:
-            Actor.log.info("No proxy configured — running without proxy.")
+            Actor.log.info("No proxy configured.")
 
-        # ── Build search URL ──────────────────────────────────────────────────
         query_str = urllib.parse.quote_plus(f"{search_query} in {location}")
         search_url = f"https://www.google.com/maps/search/{query_str}"
         Actor.log.info("Search URL: %s", search_url)
 
         city, country = _extract_city_country(location)
 
-        # ── Open search page ──────────────────────────────────────────────────
-        browser_cm, browser, page = await _open_search_page(proxy_url, search_url)
-
-        results: list[dict] = []
-        total_examined = 0
-        total_filtered_out = 0
+        # ── Open browser ───────────────────────────────────────────────────────
+        browser_cm, browser = await _open_browser(proxy_url)
 
         try:
-            # ── Collect all listing URLs ──────────────────────────────────────
-            Actor.log.info("Scrolling search results to collect listing URLs…")
-            # Collect 3× max_results to have a buffer after filtering; cap scrolls at 40
-            listing_urls = await get_listing_urls(
-                page,
-                max_scroll_attempts=40,
-                target=max_results * 3,
+            # ── Phase 1: collect listing URLs (one scrolling page) ─────────────
+            Actor.log.info("Collecting listing URLs…")
+            listing_urls = await _scroll_search_page(
+                browser, search_url, target=max_results * 3
             )
-            Actor.log.info("Collected %d listing URLs to examine.", len(listing_urls))
+            Actor.log.info("Collected %d listing URLs.", len(listing_urls))
 
             if not listing_urls:
-                Actor.log.warning(
-                    "No listings found. Check that searchQuery and location are valid."
-                )
+                Actor.log.warning("No listings found. Check searchQuery and location.")
                 return
 
-            # ── Process each listing ──────────────────────────────────────────
-            for url in listing_urls:
+            # ── Phase 2: visit listings concurrently ───────────────────────────
+            Actor.log.info(
+                "Visiting listings with concurrency=%d…", CONCURRENCY
+            )
+            semaphore = asyncio.Semaphore(CONCURRENCY)
+            tasks = [
+                _fetch_listing(browser, url, semaphore)
+                for url in listing_urls
+            ]
+            all_details = await asyncio.gather(*tasks)
+
+            # ── Phase 3: filter and score ──────────────────────────────────────
+            results: list[dict] = []
+            total_filtered = 0
+
+            for details in all_details:
                 if len(results) >= max_results:
                     break
-
-                total_examined += 1
-                Actor.log.debug("Examining listing %d: %s", total_examined, url)
-
-                # Retry loop for individual listings
-                details: dict = {}
-                for attempt in range(1, MAX_RETRIES + 1):
-                    try:
-                        details = await extract_business_details(page, url)
-                        break
-                    except Exception as exc:
-                        Actor.log.warning(
-                            "Listing %s attempt %d/%d failed: %s",
-                            url, attempt, MAX_RETRIES, exc,
-                        )
-                        await asyncio.sleep(2)
-
                 if not details or not details.get("businessName"):
-                    total_filtered_out += 1
                     continue
 
-                # ── Website classification ────────────────────────────────────
                 raw_website = details.pop("websiteUrl", None)
                 website_status = classify_website(raw_website)
 
-                # Determine eligibility
                 if website_status == "real":
-                    total_filtered_out += 1
-                    Actor.log.debug(
-                        "Skipped (real website): %s — %s",
-                        details["businessName"], raw_website,
-                    )
+                    total_filtered += 1
                     continue
 
-                if website_status == "none":
-                    pass  # Always included
-                elif website_status in ("social_only", "free_builder", "weak"):
-                    if not include_weak:
-                        total_filtered_out += 1
-                        Actor.log.debug(
-                            "Skipped (weak presence, includeWeakWebsite=false): %s",
-                            details["businessName"],
-                        )
-                        continue
+                if website_status in ("social_only", "free_builder", "weak") and not include_weak:
+                    total_filtered += 1
+                    continue
 
-                # ── Build output record ───────────────────────────────────────
-                record = {
-                    "businessName": details["businessName"],
-                    "phone": details.get("phone"),
-                    "category": details.get("category"),
-                    "address": details.get("address"),
-                    "city": city,
-                    "country": country,
-                    "rating": details.get("rating"),
-                    "reviewCount": details.get("reviewCount"),
-                    "googleMapsUrl": url,
-                    "hasPhone": details.get("hasPhone", False),
-                    "websiteStatus": website_status,
-                    "leadScore": 0,
-                    "scrapedAt": datetime.now(timezone.utc).isoformat(),
-                }
-                record["leadScore"] = calculate_lead_score(record)
-                results.append(record)
+                results.append(_build_record(details, website_status, city, country))
 
-                # Log progress
                 if len(results) % PROGRESS_LOG_EVERY == 0:
                     Actor.log.info(
-                        "Progress: %d/%d no-website businesses found "
-                        "(%d examined, %d filtered out).",
-                        len(results), max_results,
-                        total_examined, total_filtered_out,
+                        "Filtered: %d kept / %d skipped so far.", len(results), total_filtered
                     )
-
-                # Polite delay between requests
-                await asyncio.sleep(BETWEEN_REQUESTS_DELAY_MS / 1_000)
 
         finally:
             try:
@@ -216,13 +185,11 @@ async def main() -> None:
             except Exception:
                 pass
 
-        # ── Sort and push ─────────────────────────────────────────────────────
         results.sort(key=lambda r: r["leadScore"], reverse=True)
 
         Actor.log.info(
-            "Done. %d no-website businesses returned out of %d examined "
-            "(%d filtered out as having real websites or weak presence).",
-            len(results), total_examined, total_filtered_out,
+            "Done. %d leads returned (%d filtered out as having real/weak websites).",
+            len(results), total_filtered,
         )
 
         await Actor.push_data(results)

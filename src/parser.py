@@ -157,19 +157,21 @@ async def get_listing_urls(page: Page, max_scroll_attempts: int = 30, target: in
     return urls
 
 
-async def extract_business_details(page: Page, maps_url: str) -> dict[str, Any]:
+async def extract_business_details(browser, maps_url: str) -> dict[str, Any]:
     """
-    Navigate to a Google Maps place page and extract all relevant fields.
-    Returns a raw dict; caller applies filtering / scoring.
+    Open a fresh page in an existing browser, visit the Maps listing, extract
+    all fields, then close the page.  Caller passes the Camoufox browser object
+    so multiple coroutines can call this concurrently (one page each).
     """
+    page: Page = await browser.new_page()
     try:
-        # "load" fires once the DOM + subresources are ready.
+        # "load" fires once DOM + subresources are ready.
         # "networkidle" never fires on Google Maps (constant background XHRs).
         await page.goto(maps_url, wait_until="load", timeout=30_000)
-        # Short wait for JS-rendered detail panel to populate
-        await page.wait_for_timeout(1_500)
+        await page.wait_for_timeout(1_000)
     except Exception as exc:
         Actor.log.warning("Could not load listing %s: %s", maps_url, exc)
+        await page.close()
         return {}
 
     # ── Name ────────────────────────────────────────────────────────────────
@@ -234,6 +236,7 @@ async def extract_business_details(page: Page, maps_url: str) -> dict[str, Any]:
             except ValueError:
                 pass
 
+    await page.close()
     return {
         "businessName": name,
         "phone": phone,
