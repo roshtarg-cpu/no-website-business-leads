@@ -98,23 +98,40 @@ async def _try_attr(page: Page, selectors: list[str], attr: str) -> str | None:
     return None
 
 
-async def get_listing_urls(page: Page, max_scroll_attempts: int = 30) -> list[str]:
+async def get_listing_urls(page: Page, max_scroll_attempts: int = 30, target: int = 0) -> list[str]:
     """
     Scroll the left-hand search-results panel to load all cards and
     return a de-duplicated list of /maps/place/ URLs.
+    Stops early once `target` URLs are collected (0 = no limit).
     """
     urls: list[str] = []
     seen: set[str] = set()
+    no_new_count = 0
 
     for attempt in range(max_scroll_attempts):
+        prev_len = len(urls)
+
         # Collect all place links currently visible
         anchors = await page.query_selector_all('a[href*="/maps/place/"]')
         for anchor in anchors:
             href = await anchor.get_attribute("href")
             if href and "/maps/place/" in href and href not in seen:
-                # Normalise: strip trailing query params beyond the place path
                 seen.add(href)
                 urls.append(href)
+
+        # Early-exit: hit target count
+        if target and len(urls) >= target:
+            Actor.log.info("Collected target of %d listing URLs after %d scrolls.", target, attempt + 1)
+            break
+
+        # Early-exit: no new URLs found for 3 consecutive scrolls
+        if len(urls) == prev_len:
+            no_new_count += 1
+            if no_new_count >= 3:
+                Actor.log.info("No new listings found for 3 scrolls — stopping at %d URLs.", len(urls))
+                break
+        else:
+            no_new_count = 0
 
         # Scroll the results panel (not the map)
         try:
@@ -126,13 +143,15 @@ async def get_listing_urls(page: Page, max_scroll_attempts: int = 30) -> list[st
         except Exception:
             await page.evaluate("window.scrollBy(0, 2000)")
 
-        await page.wait_for_timeout(1_500)
+        # 700 ms is enough for lazy-loaded cards to appear
+        await page.wait_for_timeout(700)
 
-        # Detect end-of-results sentinel
-        end_marker = await page.query_selector('span.HlvSq')
-        if end_marker:
-            Actor.log.info("Reached end of search results after %d scrolls.", attempt + 1)
-            break
+        # Detect end-of-results sentinel (multiple known class names)
+        for sentinel in ('span.HlvSq', 'span.wmrBd', 'div.PbZDve p.fontBodyMedium'):
+            end_marker = await page.query_selector(sentinel)
+            if end_marker:
+                Actor.log.info("Reached end of search results after %d scrolls.", attempt + 1)
+                return urls
 
     Actor.log.info("Found %d listing URLs in search results.", len(urls))
     return urls
@@ -144,8 +163,11 @@ async def extract_business_details(page: Page, maps_url: str) -> dict[str, Any]:
     Returns a raw dict; caller applies filtering / scoring.
     """
     try:
-        await page.goto(maps_url, wait_until="networkidle", timeout=60_000)
-        await page.wait_for_timeout(2_000)
+        # "load" fires once the DOM + subresources are ready.
+        # "networkidle" never fires on Google Maps (constant background XHRs).
+        await page.goto(maps_url, wait_until="load", timeout=30_000)
+        # Short wait for JS-rendered detail panel to populate
+        await page.wait_for_timeout(1_500)
     except Exception as exc:
         Actor.log.warning("Could not load listing %s: %s", maps_url, exc)
         return {}

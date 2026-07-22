@@ -28,8 +28,8 @@ from .utils import (
 )
 
 MAX_RETRIES = 3
-BETWEEN_REQUESTS_DELAY_MS = 1_500   # 1.5 s between listing visits
-PROGRESS_LOG_EVERY = 10              # log progress every N results
+BETWEEN_REQUESTS_DELAY_MS = 500     # 0.5 s between listing visits (page.goto already takes time)
+PROGRESS_LOG_EVERY = 10             # log progress every N results
 
 
 async def _open_search_page(proxy_url: str | None, search_url: str):
@@ -49,8 +49,10 @@ async def _open_search_page(proxy_url: str | None, search_url: str):
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            await page.goto(search_url, wait_until="networkidle", timeout=90_000)
-            await page.wait_for_timeout(3_000)
+            # Use "load" — Google Maps never reaches networkidle due to
+            # continuous background XHRs, which would burn the full timeout.
+            await page.goto(search_url, wait_until="load", timeout=60_000)
+            await page.wait_for_timeout(2_000)
             html = await page.content()
             if len(html) > 500:
                 Actor.log.info("Search page loaded (%d bytes).", len(html))
@@ -114,7 +116,12 @@ async def main() -> None:
         try:
             # ── Collect all listing URLs ──────────────────────────────────────
             Actor.log.info("Scrolling search results to collect listing URLs…")
-            listing_urls = await get_listing_urls(page, max_scroll_attempts=50)
+            # Collect 3× max_results to have a buffer after filtering; cap scrolls at 40
+            listing_urls = await get_listing_urls(
+                page,
+                max_scroll_attempts=40,
+                target=max_results * 3,
+            )
             Actor.log.info("Collected %d listing URLs to examine.", len(listing_urls))
 
             if not listing_urls:
