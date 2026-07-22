@@ -83,10 +83,14 @@ async def main() -> None:
 
         run = await client.actor(UPSTREAM_ACTOR).call(
             run_input={
-                "searchStringsArray": [f"{search_query} in {location}"],
+                # searchStringsArray = business type only (no location suffix)
+                # locationQuery = explicit location so the actor geotargets correctly
+                # (without locationQuery it guesses from the proxy IP)
+                "searchStringsArray": [search_query],
+                "locationQuery": location,
                 "maxCrawledPlacesPerSearch": fetch_count,
                 "language": "en",
-                "website": "withoutWebsite",  # only businesses with NO website
+                "website": "withoutWebsite",
                 "scrapeContacts": False,
                 "additionalInfo": False,
             },
@@ -96,12 +100,13 @@ async def main() -> None:
         if not run:
             raise RuntimeError("Upstream actor run failed to start.")
 
+        # apify_client returns a Run dataclass — use attribute access, not dict keys
         Actor.log.info(
             "Upstream run %s finished (status: %s). Fetching results…",
-            run["id"], run["status"],
+            run.id, run.status,
         )
 
-        dataset_id = run.get("defaultDatasetId")
+        dataset_id = run.default_dataset_id
         if not dataset_id:
             raise RuntimeError("No dataset returned by upstream actor.")
 
