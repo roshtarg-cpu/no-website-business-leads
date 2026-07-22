@@ -1,0 +1,22 @@
+{
+  "actorSpecification": 1,
+  "name": "no-website-business-leads",
+  "title": "Find Businesses Without a Website — Lead Scraper for Web Designers & AI Website Agencies",
+  "description": "Scrape businesses with no website from Google Maps in any city worldwide. Returns name, phone, address and lead score. Built for web designers, AI website agencies and anyone selling websites to local businesses. Global coverage.",
+  "version": "0.1",
+  "buildTag": "latest",
+  "environmentVariables": {},
+  "dockerfile": "./Dockerfile",
+  "tags": [
+    "lead-generation",
+    "web-design",
+    "no-website",
+    "google-maps",
+    "local-business",
+    "phone-numbers",
+    "web-designer-leads",
+    "global",
+    "ai-agent",
+    "mcp"
+  ]
+}

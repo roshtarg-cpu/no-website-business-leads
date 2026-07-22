@@ -1,0 +1,44 @@
+{
+  "title": "No Website Business Leads",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "searchQuery": {
+      "title": "Business Type",
+      "type": "string",
+      "description": "Type of business to find that needs a website e.g. restaurants, plumbers, dentists, salons, contractors",
+      "editor": "textfield"
+    },
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "description": "City and country to find businesses without websites e.g. London UK, New York USA, Dubai UAE, Mumbai India",
+      "editor": "textfield"
+    },
+    "maxResults": {
+      "title": "Max Results",
+      "type": "integer",
+      "description": "Maximum number of no-website businesses to return",
+      "default": 100,
+      "editor": "number"
+    },
+    "includeWeakWebsite": {
+      "title": "Include Weak Web Presence",
+      "type": "boolean",
+      "description": "Also include businesses with only Facebook, Linktree or free Wix sites instead of a real website",
+      "default": false,
+      "editor": "checkbox"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Use Apify residential proxies to avoid blocks.",
+      "editor": "proxy",
+      "prefill": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
+      }
+    }
+  },
+  "required": ["searchQuery", "location"]
+}
