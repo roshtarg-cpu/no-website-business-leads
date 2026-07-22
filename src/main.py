@@ -86,7 +86,7 @@ async def main() -> None:
                 "searchStringsArray": [f"{search_query} in {location}"],
                 "maxCrawledPlacesPerSearch": fetch_count,
                 "language": "en",
-                "website": "EMPTY",        # only businesses with NO website
+                "website": "withoutWebsite",  # only businesses with NO website
                 "scrapeContacts": False,
                 "additionalInfo": False,
             },
