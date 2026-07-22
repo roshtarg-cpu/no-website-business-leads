@@ -1,8 +1,10 @@
 """
-Google Maps HTML / DOM parser.
+Google Maps parser — click-based extraction.
 
-Extracts business listing cards from a search-results page and detailed
-business information from an individual listing page.
+Instead of navigating to each listing URL (page.goto = 3-5s each),
+we click cards in the left search panel.  Google Maps is a SPA:
+clicking a card updates the right detail panel in ~500ms without a
+full page reload.  This is 6-10x faster than the page.goto approach.
 """
 
 from __future__ import annotations
@@ -15,246 +17,160 @@ from playwright.async_api import Page
 
 from .utils import clean_phone
 
-
 # ── Selectors ────────────────────────────────────────────────────────────────
-# Google Maps frequently changes its HTML structure.  We target multiple
-# candidate selectors so the actor degrades gracefully if one disappears.
 
-# Container for each result card on the search-results panel
-RESULT_CARD_SELECTORS = [
-    'div[role="feed"] > div[jsaction]',
-    'div.Nv2PK',
-    'a[href*="/maps/place/"]',
-]
+# Result cards in the left sidebar
+CARD_SELECTOR = 'a.hfpxzc'          # primary (modern Maps)
+CARD_FALLBACK = 'a[href*="/maps/place/"]'
 
-# Individual detail panel selectors (opened after clicking a card)
-DETAIL_SELECTORS = {
-    "name": [
-        'h1.DUwDvf',
-        'h1[class*="fontHeadlineLarge"]',
-        'div[class*="tAiQdd"] h1',
-        'div.lMbq3e h1',
-    ],
-    "category": [
-        'button[jsaction*="category"]',
-        'div.skqShb button',
-        'span.DkEaL',
-        'button.DkEaL',
-    ],
-    "address": [
-        'button[data-item-id="address"]',
-        'div[data-item-id="address"] div.rogA2c',
-        'button[aria-label*="Address"]',
-    ],
-    "phone": [
-        'button[data-item-id^="phone"]',
-        'div[data-item-id^="phone"] div.rogA2c',
-        'button[aria-label*="Phone"]',
-        'a[href^="tel:"]',
-    ],
-    "website": [
-        'a[data-item-id="authority"]',
-        'div[data-item-id="authority"] a',
-        'a[aria-label*="website" i]',
-        'a[href*="http"][class*="CsEnBe"]',
-    ],
-    "rating": [
-        'div.F7nice span[aria-hidden="true"]',
-        'span.ceNzKf',
-        'div.fontDisplayLarge',
-    ],
-    "review_count": [
-        'div.F7nice span[aria-label*="review"]',
-        'span[aria-label*="review"]',
-    ],
+# Feed container (left sidebar)
+FEED_SELECTORS = ['div[role="feed"]', 'div.m6QErb', 'div[jsaction*="pane"]']
+
+# Right-panel detail fields
+DETAIL = {
+    "name": ['h1.DUwDvf', 'h1[class*="fontHeadlineLarge"]', 'div.lMbq3e h1', 'h1'],
+    "category": ['button[jsaction*="category"]', 'span.DkEaL', 'button.DkEaL', 'div.skqShb button'],
+    "address": ['button[data-item-id="address"]', 'div[data-item-id="address"] div.rogA2c', 'button[aria-label*="Address"]'],
+    "phone": ['button[data-item-id^="phone"]', 'div[data-item-id^="phone"] div.rogA2c', 'button[aria-label*="Phone"]', 'a[href^="tel:"]'],
+    "website": ['a[data-item-id="authority"]', 'div[data-item-id="authority"] a', 'a[aria-label*="website" i]', 'a[href*="http"][class*="CsEnBe"]'],
+    "rating": ['div.F7nice span[aria-hidden="true"]', 'span.ceNzKf'],
+    "review_count": ['div.F7nice span[aria-label*="review"]', 'span[aria-label*="review"]'],
 }
 
 
-async def _try_text(page: Page, selectors: list[str]) -> str | None:
-    """Return inner text of the first matching selector, or None."""
+async def _text(page: Page, selectors: list[str]) -> str | None:
     for sel in selectors:
         try:
             el = await page.query_selector(sel)
             if el:
-                text = await el.inner_text()
-                if text and text.strip():
-                    return text.strip()
+                t = await el.inner_text()
+                if t and t.strip():
+                    return t.strip()
         except Exception:
             continue
     return None
 
 
-async def _try_attr(page: Page, selectors: list[str], attr: str) -> str | None:
-    """Return an attribute value of the first matching selector, or None."""
+async def _attr(page: Page, selectors: list[str], attr: str) -> str | None:
     for sel in selectors:
         try:
             el = await page.query_selector(sel)
             if el:
-                val = await el.get_attribute(attr)
-                if val and val.strip():
-                    return val.strip()
+                v = await el.get_attribute(attr)
+                if v and v.strip():
+                    return v.strip()
         except Exception:
             continue
     return None
 
 
-async def get_listing_urls(page: Page, max_scroll_attempts: int = 30, target: int = 0) -> list[str]:
-    """
-    Scroll the left-hand search-results panel to load all cards and
-    return a de-duplicated list of /maps/place/ URLs.
-    Stops early once `target` URLs are collected (0 = no limit).
-    """
-    # Wait for the results feed to be JS-rendered before we start collecting.
-    # Google Maps fires the "load" event before React/JS renders the cards.
-    feed_selectors = ['div[role="feed"]', 'div.m6QErb', 'div[jsaction*="mouseover:pane"]']
-    feed_found = False
-    for sel in feed_selectors:
+async def wait_for_feed(page: Page) -> bool:
+    """Wait for the search results feed to be JS-rendered. Returns True if found."""
+    for sel in FEED_SELECTORS:
         try:
-            await page.wait_for_selector(sel, timeout=15_000)
-            feed_found = True
-            Actor.log.info("Results feed detected with selector: %s", sel)
-            break
+            await page.wait_for_selector(sel, timeout=20_000)
+            await page.wait_for_timeout(1_000)
+            Actor.log.info("Results feed ready.")
+            return True
         except Exception:
             continue
-    if not feed_found:
-        Actor.log.warning("Results feed not detected — proceeding anyway after 5s wait.")
-        await page.wait_for_timeout(5_000)
-    else:
-        await page.wait_for_timeout(1_000)  # let cards finish rendering
+    Actor.log.warning("Feed not detected — proceeding after 4s fallback wait.")
+    await page.wait_for_timeout(4_000)
+    return False
 
-    urls: list[str] = []
-    seen: set[str] = set()
-    no_new_count = 0
 
-    for attempt in range(max_scroll_attempts):
-        prev_len = len(urls)
-
-        # Collect all place links currently visible.
-        # Google Maps wraps each card in an <a> whose href is /maps/place/...
-        # Fallback: some builds use data-href or jsaction attributes instead.
-        for anchor_sel in ('a[href*="/maps/place/"]', 'a[data-href*="/maps/place/"]'):
-            anchors = await page.query_selector_all(anchor_sel)
-            for anchor in anchors:
-                href = (await anchor.get_attribute("href")) or (await anchor.get_attribute("data-href"))
-                if href and "/maps/place/" in href and href not in seen:
-                    seen.add(href)
-                    urls.append(href)
-
-        if attempt == 0:
-            Actor.log.info("First scroll pass: found %d URLs so far.", len(urls))
-
-        # Early-exit: hit target count
-        if target and len(urls) >= target:
-            Actor.log.info("Collected target of %d listing URLs after %d scrolls.", target, attempt + 1)
+async def get_card_hrefs(page: Page) -> dict[str, Any]:
+    """
+    Return {href: element} for all currently visible, unprocessed cards.
+    Primary selector first, fallback second.
+    """
+    cards: dict[str, Any] = {}
+    for sel in (CARD_SELECTOR, CARD_FALLBACK):
+        els = await page.query_selector_all(sel)
+        for el in els:
+            href = await el.get_attribute("href") or ""
+            if "/maps/place/" in href and href not in cards:
+                cards[href] = el
+        if cards:
             break
+    return cards
 
-        # Early-exit: no new URLs found for 3 consecutive scrolls
-        if len(urls) == prev_len:
-            no_new_count += 1
-            if no_new_count >= 3:
-                Actor.log.info("No new listings found for 3 scrolls — stopping at %d URLs.", len(urls))
-                break
+
+async def scroll_feed(page: Page) -> None:
+    """Scroll the left-panel feed to load more results."""
+    try:
+        panel = await page.query_selector('div[role="feed"]')
+        if panel:
+            await panel.evaluate("el => el.scrollBy(0, 2000)")
         else:
-            no_new_count = 0
-
-        # Scroll the results panel (not the map)
-        try:
-            panel = await page.query_selector('div[role="feed"]')
-            if panel:
-                await panel.evaluate("el => el.scrollBy(0, 2000)")
-            else:
-                await page.evaluate("window.scrollBy(0, 2000)")
-        except Exception:
-            await page.evaluate("window.scrollBy(0, 2000)")
-
-        # 700 ms is enough for lazy-loaded cards to appear
-        await page.wait_for_timeout(700)
-
-        # Detect end-of-results sentinel (multiple known class names)
-        for sentinel in ('span.HlvSq', 'span.wmrBd', 'div.PbZDve p.fontBodyMedium'):
-            end_marker = await page.query_selector(sentinel)
-            if end_marker:
-                Actor.log.info("Reached end of search results after %d scrolls.", attempt + 1)
-                return urls
-
-    Actor.log.info("Found %d listing URLs in search results.", len(urls))
-    return urls
+            await page.keyboard.press("End")
+    except Exception:
+        await page.evaluate("window.scrollBy(0, 2000)")
+    await page.wait_for_timeout(1_200)
 
 
-async def extract_business_details(page: Page, maps_url: str) -> dict[str, Any]:
+async def click_and_extract(page: Page, card_el, maps_url: str) -> dict[str, Any]:
     """
-    Navigate an already-open page to a Maps listing URL and extract all fields.
-    Caller is responsible for creating and closing the page.
+    Click a search result card and extract details from the right detail panel.
+    Falls back to page.goto if the click causes a full navigation.
+    Returns {} on failure.
     """
     try:
-        # domcontentloaded fires as soon as the DOM is parsed — much faster than
-        # "load" (waits for images/fonts) or "networkidle" (never fires on Maps).
-        await page.goto(maps_url, wait_until="domcontentloaded", timeout=25_000)
-        # Wait for the business name heading to appear (JS-rendered)
-        try:
-            await page.wait_for_selector("h1", timeout=6_000)
-        except Exception:
-            pass  # proceed anyway; extraction will return {} if name is missing
+        await card_el.scroll_into_view_if_needed()
+        await card_el.click()
+        # Wait for the business name heading to appear in the detail panel
+        await page.wait_for_selector("h1", timeout=6_000)
+        await page.wait_for_timeout(400)
     except Exception as exc:
-        Actor.log.warning("Could not load listing %s: %s", maps_url, exc)
-        return {}
+        Actor.log.debug("Card click failed for %s: %s", maps_url, exc)
+        # Fall back to direct navigation
+        try:
+            await page.goto(maps_url, wait_until="domcontentloaded", timeout=25_000)
+            await page.wait_for_selector("h1", timeout=5_000)
+        except Exception:
+            return {}
 
-    # ── Name ────────────────────────────────────────────────────────────────
-    name = await _try_text(page, DETAIL_SELECTORS["name"])
+    return await _extract_panel(page, maps_url)
+
+
+async def _extract_panel(page: Page, maps_url: str) -> dict[str, Any]:
+    """Extract all detail fields from whichever panel is currently showing."""
+    name = await _text(page, DETAIL["name"])
     if not name:
-        Actor.log.debug("No name found for %s — skipping.", maps_url)
         return {}
 
-    # ── Category ────────────────────────────────────────────────────────────
-    category = await _try_text(page, DETAIL_SELECTORS["category"])
+    category = await _text(page, DETAIL["category"])
 
-    # ── Address ─────────────────────────────────────────────────────────────
-    address_raw = await _try_text(page, DETAIL_SELECTORS["address"])
-    # Also try aria-label attribute (often contains the full address)
-    if not address_raw:
-        address_raw = await _try_attr(page, DETAIL_SELECTORS["address"], "aria-label")
-    address = address_raw.replace("Address: ", "").strip() if address_raw else None
+    address_raw = await _text(page, DETAIL["address"]) or await _attr(page, DETAIL["address"], "aria-label")
+    address = re.sub(r"^Address:\s*", "", address_raw, flags=re.IGNORECASE).strip() if address_raw else None
 
-    # ── Phone ────────────────────────────────────────────────────────────────
-    phone_raw = await _try_text(page, DETAIL_SELECTORS["phone"])
+    phone_raw = await _text(page, DETAIL["phone"])
     if not phone_raw:
-        # Try aria-label which sometimes contains the number
-        phone_raw = await _try_attr(page, DETAIL_SELECTORS["phone"], "aria-label")
+        phone_raw = await _attr(page, DETAIL["phone"], "aria-label")
         if phone_raw:
-            # Strip prefix like "Phone: "
             phone_raw = re.sub(r"^Phone:\s*", "", phone_raw, flags=re.IGNORECASE)
-    # Try tel: href
     if not phone_raw:
-        tel_href = await _try_attr(page, ['a[href^="tel:"]'], "href")
-        if tel_href:
-            phone_raw = tel_href.replace("tel:", "")
+        tel = await _attr(page, ['a[href^="tel:"]'], "href")
+        if tel:
+            phone_raw = tel.replace("tel:", "")
     phone = clean_phone(phone_raw)
 
-    # ── Website ──────────────────────────────────────────────────────────────
-    website_url = await _try_attr(page, DETAIL_SELECTORS["website"], "href")
-    if not website_url:
-        website_url = await _try_text(page, DETAIL_SELECTORS["website"])
+    website_url = await _attr(page, DETAIL["website"], "href") or await _text(page, DETAIL["website"])
 
-    # ── Rating ───────────────────────────────────────────────────────────────
     rating: float | None = None
-    rating_text = await _try_text(page, DETAIL_SELECTORS["rating"])
-    if rating_text:
-        m = re.search(r"(\d+[.,]\d+)", rating_text)
+    rt = await _text(page, DETAIL["rating"])
+    if rt:
+        m = re.search(r"(\d+[.,]\d+)", rt)
         if m:
             try:
                 rating = float(m.group(1).replace(",", "."))
             except ValueError:
                 pass
 
-    # ── Review count ─────────────────────────────────────────────────────────
     review_count: int | None = None
-    review_text = await _try_text(page, DETAIL_SELECTORS["review_count"])
-    if not review_text:
-        review_text = await _try_attr(
-            page, DETAIL_SELECTORS["review_count"], "aria-label"
-        )
-    if review_text:
-        m = re.search(r"([\d,]+)\s+review", review_text, re.IGNORECASE)
+    rct = await _text(page, DETAIL["review_count"]) or await _attr(page, DETAIL["review_count"], "aria-label")
+    if rct:
+        m = re.search(r"([\d,]+)\s+review", rct, re.IGNORECASE)
         if m:
             try:
                 review_count = int(m.group(1).replace(",", ""))

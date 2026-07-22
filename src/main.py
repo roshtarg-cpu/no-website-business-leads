@@ -1,12 +1,14 @@
 """
 Main entry point for the No-Website Business Leads actor.
 
-Flow:
-1. Read actor input.
-2. Open Google Maps search page and scroll to collect listing URLs.
-3. Visit listings with CONCURRENCY=2 (safe for container memory).
-4. Restart browser automatically on crash.
-5. Filter, score, sort, push to dataset.
+Architecture: single-page, click-based extraction.
+
+Instead of opening a new browser page for every listing (page.goto = 3-5s,
+causes OOM with concurrency), we stay on the search-results page and
+CLICK each card.  Google Maps is a SPA: clicking a card updates the
+right detail panel in ~500 ms without a full page reload.
+
+One browser.  One page.  No concurrency issues.  6-10x faster.
 """
 
 from __future__ import annotations
@@ -19,24 +21,24 @@ from urllib.parse import urlparse, urlunparse
 from apify import Actor
 from camoufox.async_api import AsyncCamoufox
 
-from .parser import extract_business_details, get_listing_urls
+from .parser import (
+    click_and_extract,
+    get_card_hrefs,
+    scroll_feed,
+    wait_for_feed,
+)
 from .utils import (
     _parse_proxy,
     calculate_lead_score,
     classify_website,
 )
 
-CONCURRENCY = 2   # 2 concurrent pages is safe on Apify containers
-MAX_RETRIES = 2
-PROGRESS_LOG_EVERY = 5
+MAX_STALE_SCROLLS = 4   # stop scrolling after this many scrolls with no new cards
+MAX_SCROLLS = 60        # absolute cap on scroll attempts
 
 
 def _clean_maps_url(url: str) -> str:
-    """Strip tracking/auth query params from a Maps place URL.
-
-    Removes ?authuser=, hl=, rclk= etc. that can trigger bot detection
-    or return non-English UI that breaks our CSS selectors.
-    """
+    """Strip tracking/lang query params that can break selectors or trigger bans."""
     p = urlparse(url)
     return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
@@ -68,66 +70,6 @@ def _build_record(details: dict, website_status: str, city: str, country: str) -
     return record
 
 
-class BrowserManager:
-    """Holds a Camoufox browser and restarts it on crash."""
-
-    def __init__(self, proxy_url: str | None):
-        self._proxy_url = proxy_url
-        self._cm = None
-        self.browser = None
-        self._lock = asyncio.Lock()
-
-    async def start(self) -> None:
-        proxy = _parse_proxy(self._proxy_url)
-        self._cm = AsyncCamoufox(
-            headless=True,
-            proxy=proxy,
-            geoip=True,
-            firefox_user_prefs={"security.sandbox.content.level": 0},
-        )
-        self.browser = await self._cm.__aenter__()
-
-    async def stop(self) -> None:
-        if self._cm:
-            try:
-                await self._cm.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._cm = None
-            self.browser = None
-
-    async def restart(self) -> None:
-        async with self._lock:
-            Actor.log.warning("Restarting browser after crash…")
-            await self.stop()
-            await self.start()
-
-
-async def _fetch_one(mgr: BrowserManager, url: str, semaphore: asyncio.Semaphore) -> dict:
-    """Fetch one listing under the semaphore; restarts browser on crash."""
-    clean_url = _clean_maps_url(url)
-    async with semaphore:
-        for attempt in range(1, MAX_RETRIES + 1):
-            page = None
-            try:
-                page = await mgr.browser.new_page()
-                details = await extract_business_details(page, clean_url)
-                return details
-            except Exception as exc:
-                msg = str(exc).lower()
-                Actor.log.warning("Attempt %d/%d failed %s: %s", attempt, MAX_RETRIES, clean_url, exc)
-                if any(kw in msg for kw in ("crashed", "closed", "disconnected", "browser")):
-                    await mgr.restart()
-                await asyncio.sleep(1)
-            finally:
-                if page:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-        return {}
-
-
 async def main() -> None:
     async with Actor:
         actor_input = await Actor.get_input() or {}
@@ -155,77 +97,106 @@ async def main() -> None:
 
         city, country = _extract_city_country(location)
 
-        # ── Phase 1: scroll search results for listing URLs ────────────────────
-        mgr = BrowserManager(proxy_url)
-        await mgr.start()
+        # ── Open browser + single page ─────────────────────────────────────────
+        proxy = _parse_proxy(proxy_url)
+        async with AsyncCamoufox(
+            headless=True,
+            proxy=proxy,
+            geoip=True,
+            firefox_user_prefs={"security.sandbox.content.level": 0},
+        ) as browser:
+            page = await browser.new_page()
 
-        try:
-            scroll_page = await mgr.browser.new_page()
-            try:
-                await scroll_page.goto(search_url, wait_until="load", timeout=60_000)
-                # Extra wait: Maps fires "load" before JS renders the result cards
-                await scroll_page.wait_for_timeout(3_000)
-                html = await scroll_page.content()
-                Actor.log.info("Search page loaded (%d bytes).", len(html))
+            # Load search results
+            Actor.log.info("Loading Google Maps search…")
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
+            await wait_for_feed(page)
 
-                Actor.log.info("Collecting listing URLs…")
-                listing_urls = await get_listing_urls(
-                    scroll_page,
-                    max_scroll_attempts=40,
-                    target=max_results * 3,
-                )
-            finally:
-                await scroll_page.close()
-
-            Actor.log.info("Collected %d listing URLs.", len(listing_urls))
-            if not listing_urls:
-                Actor.log.warning("No listings found. Check searchQuery and location.")
-                return
-
-            # ── Phase 2: concurrent listing visits ─────────────────────────────
-            Actor.log.info("Visiting listings (concurrency=%d)…", CONCURRENCY)
-            semaphore = asyncio.Semaphore(CONCURRENCY)
-            tasks = [_fetch_one(mgr, url, semaphore) for url in listing_urls]
-            all_details = await asyncio.gather(*tasks)
-
-            # ── Phase 3: filter and score ──────────────────────────────────────
             results: list[dict] = []
-            count_failed = 0
+            processed: set[str] = set()   # clean URLs already visited
             count_has_website = 0
             count_weak_skipped = 0
+            count_failed = 0
+            stale_scrolls = 0
+            scroll_count = 0
 
-            for details in all_details:
+            Actor.log.info("Starting card-click extraction…")
+
+            while len(results) < max_results and stale_scrolls < MAX_STALE_SCROLLS and scroll_count <= MAX_SCROLLS:
+
+                # Get all currently visible cards in the left sidebar
+                cards = await get_card_hrefs(page)
+                new_this_pass = 0
+
+                for raw_href, card_el in cards.items():
+                    if len(results) >= max_results:
+                        break
+
+                    clean_url = _clean_maps_url(raw_href)
+                    if clean_url in processed:
+                        continue
+                    processed.add(clean_url)
+                    new_this_pass += 1
+
+                    # Click card → SPA navigation → right panel updates (~500ms)
+                    details = await click_and_extract(page, card_el, clean_url)
+
+                    if not details or not details.get("businessName"):
+                        count_failed += 1
+                        Actor.log.debug("Extraction failed: %s", clean_url)
+                        continue
+
+                    raw_website = details.pop("websiteUrl", None)
+                    status = classify_website(raw_website)
+
+                    if status == "real":
+                        count_has_website += 1
+                        Actor.log.info(
+                            "Skip (has website): %s", details["businessName"]
+                        )
+                        continue
+
+                    if status in ("social_only", "free_builder", "weak") and not include_weak:
+                        count_weak_skipped += 1
+                        Actor.log.info(
+                            "Skip (weak presence): %s", details["businessName"]
+                        )
+                        continue
+
+                    record = _build_record(details, status, city, country)
+                    results.append(record)
+                    Actor.log.info(
+                        "[%d/%d] LEAD: %s | score=%d | phone=%s | website=%s",
+                        len(results), max_results,
+                        record["businessName"],
+                        record["leadScore"],
+                        record["phone"] or "none",
+                        status,
+                    )
+
+                # Track whether scrolling is yielding new cards
+                if new_this_pass == 0:
+                    stale_scrolls += 1
+                    Actor.log.debug("No new cards this pass (%d/%d stale).", stale_scrolls, MAX_STALE_SCROLLS)
+                else:
+                    stale_scrolls = 0
+
                 if len(results) >= max_results:
                     break
 
-                if not details or not details.get("businessName"):
-                    count_failed += 1
-                    continue
+                # Scroll the feed panel to load more cards
+                await scroll_feed(page)
+                scroll_count += 1
+                Actor.log.debug(
+                    "Scroll %d | processed=%d | leads=%d | with-website=%d",
+                    scroll_count, len(processed), len(results), count_has_website,
+                )
 
-                raw_website = details.pop("websiteUrl", None)
-                website_status = classify_website(raw_website)
-
-                if website_status == "real":
-                    count_has_website += 1
-                    Actor.log.debug("Skipped (real website): %s", details["businessName"])
-                    continue
-
-                if website_status in ("social_only", "free_builder", "weak") and not include_weak:
-                    count_weak_skipped += 1
-                    continue
-
-                results.append(_build_record(details, website_status, city, country))
-
-                if len(results) % PROGRESS_LOG_EVERY == 0:
-                    Actor.log.info("Found %d/%d leads so far.", len(results), max_results)
-
-        finally:
-            await mgr.stop()
-
+        # ── Sort and push ──────────────────────────────────────────────────────
         results.sort(key=lambda r: r["leadScore"], reverse=True)
 
         Actor.log.info(
-            "Done: %d leads returned | %d had real websites | %d weak-skipped | %d extraction failed.",
+            "Done: %d leads | %d had real websites | %d weak-skipped | %d failed extraction",
             len(results), count_has_website, count_weak_skipped, count_failed,
         )
 
