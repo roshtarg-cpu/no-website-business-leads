@@ -104,6 +104,24 @@ async def get_listing_urls(page: Page, max_scroll_attempts: int = 30, target: in
     return a de-duplicated list of /maps/place/ URLs.
     Stops early once `target` URLs are collected (0 = no limit).
     """
+    # Wait for the results feed to be JS-rendered before we start collecting.
+    # Google Maps fires the "load" event before React/JS renders the cards.
+    feed_selectors = ['div[role="feed"]', 'div.m6QErb', 'div[jsaction*="mouseover:pane"]']
+    feed_found = False
+    for sel in feed_selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=15_000)
+            feed_found = True
+            Actor.log.info("Results feed detected with selector: %s", sel)
+            break
+        except Exception:
+            continue
+    if not feed_found:
+        Actor.log.warning("Results feed not detected — proceeding anyway after 5s wait.")
+        await page.wait_for_timeout(5_000)
+    else:
+        await page.wait_for_timeout(1_000)  # let cards finish rendering
+
     urls: list[str] = []
     seen: set[str] = set()
     no_new_count = 0
@@ -111,13 +129,19 @@ async def get_listing_urls(page: Page, max_scroll_attempts: int = 30, target: in
     for attempt in range(max_scroll_attempts):
         prev_len = len(urls)
 
-        # Collect all place links currently visible
-        anchors = await page.query_selector_all('a[href*="/maps/place/"]')
-        for anchor in anchors:
-            href = await anchor.get_attribute("href")
-            if href and "/maps/place/" in href and href not in seen:
-                seen.add(href)
-                urls.append(href)
+        # Collect all place links currently visible.
+        # Google Maps wraps each card in an <a> whose href is /maps/place/...
+        # Fallback: some builds use data-href or jsaction attributes instead.
+        for anchor_sel in ('a[href*="/maps/place/"]', 'a[data-href*="/maps/place/"]'):
+            anchors = await page.query_selector_all(anchor_sel)
+            for anchor in anchors:
+                href = (await anchor.get_attribute("href")) or (await anchor.get_attribute("data-href"))
+                if href and "/maps/place/" in href and href not in seen:
+                    seen.add(href)
+                    urls.append(href)
+
+        if attempt == 0:
+            Actor.log.info("First scroll pass: found %d URLs so far.", len(urls))
 
         # Early-exit: hit target count
         if target and len(urls) >= target:

@@ -163,7 +163,8 @@ async def main() -> None:
             scroll_page = await mgr.browser.new_page()
             try:
                 await scroll_page.goto(search_url, wait_until="load", timeout=60_000)
-                await scroll_page.wait_for_timeout(2_000)
+                # Extra wait: Maps fires "load" before JS renders the result cards
+                await scroll_page.wait_for_timeout(3_000)
                 html = await scroll_page.content()
                 Actor.log.info("Search page loaded (%d bytes).", len(html))
 
