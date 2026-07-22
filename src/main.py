@@ -19,7 +19,7 @@ from .utils import calculate_lead_score, classify_website
 
 # The upstream scraper that does the heavy lifting.
 # apify/google-maps-scraper is the official, maintained Apify actor.
-UPSTREAM_ACTOR = "apify/google-maps-scraper"
+UPSTREAM_ACTOR = "compass/crawler-google-places"
 
 
 def _extract_city_country(location: str) -> tuple[str, str]:
@@ -65,9 +65,9 @@ async def main() -> None:
         city, country = _extract_city_country(location)
 
         # ── Call upstream scraper ──────────────────────────────────────────────
-        # We ask for 3× max_results because many businesses will be filtered out
-        # (they have real websites).  Typical hit-rate for no-website is 20-40%.
-        fetch_count = min(max_results * 4, 500)
+        # Pass website="EMPTY" to the upstream actor so it only returns businesses
+        # with no website — we fetch exactly what we need, no over-fetching.
+        fetch_count = max_results
 
         Actor.log.info(
             "Calling %s for '%s in %s' (fetching up to %d listings)…",
@@ -86,9 +86,9 @@ async def main() -> None:
                 "searchStringsArray": [f"{search_query} in {location}"],
                 "maxCrawledPlacesPerSearch": fetch_count,
                 "language": "en",
-                "exportPlaceUrls": False,
-                "additionalInfo": False,
+                "website": "EMPTY",        # only businesses with NO website
                 "scrapeContacts": False,
+                "additionalInfo": False,
             },
             build="latest",
         )
