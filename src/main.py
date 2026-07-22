@@ -4,9 +4,9 @@ Main entry point for the No-Website Business Leads actor.
 Flow:
 1. Read actor input.
 2. Open Google Maps search page and scroll to collect listing URLs.
-3. Visit listings CONCURRENTLY (up to CONCURRENCY pages at once).
-4. Filter out businesses with real websites.
-5. Calculate lead score, sort, push to dataset.
+3. Visit listings with CONCURRENCY=2 (safe for container memory).
+4. Restart browser automatically on crash.
+5. Filter, score, sort, push to dataset.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import urllib.parse
 from datetime import datetime, timezone
+from urllib.parse import urlparse, urlunparse
 
 from apify import Actor
 from camoufox.async_api import AsyncCamoufox
@@ -25,49 +26,19 @@ from .utils import (
     classify_website,
 )
 
-CONCURRENCY = 5          # parallel listing pages open at once
+CONCURRENCY = 2   # 2 concurrent pages is safe on Apify containers
 MAX_RETRIES = 2
-PROGRESS_LOG_EVERY = 10
+PROGRESS_LOG_EVERY = 5
 
 
-async def _open_browser(proxy_url: str | None):
-    """Start Camoufox browser and return (context_manager, browser)."""
-    proxy = _parse_proxy(proxy_url)
-    browser_cm = AsyncCamoufox(
-        headless=True,
-        proxy=proxy,
-        geoip=True,
-        firefox_user_prefs={"security.sandbox.content.level": 0},
-    )
-    browser = await browser_cm.__aenter__()
-    return browser_cm, browser
+def _clean_maps_url(url: str) -> str:
+    """Strip tracking/auth query params from a Maps place URL.
 
-
-async def _scroll_search_page(browser, search_url: str, target: int) -> list[str]:
-    """Open search page on a dedicated page, scroll, return listing URLs."""
-    page = await browser.new_page()
-    try:
-        await page.goto(search_url, wait_until="load", timeout=60_000)
-        await page.wait_for_timeout(2_000)
-        html = await page.content()
-        Actor.log.info("Search page loaded (%d bytes).", len(html))
-        urls = await get_listing_urls(page, max_scroll_attempts=40, target=target)
-    finally:
-        await page.close()
-    return urls
-
-
-async def _fetch_listing(browser, url: str, semaphore: asyncio.Semaphore) -> dict:
-    """Fetch one listing under the concurrency semaphore, with retries."""
-    async with semaphore:
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                details = await extract_business_details(browser, url)
-                return details
-            except Exception as exc:
-                Actor.log.warning("Listing attempt %d/%d failed %s: %s", attempt, MAX_RETRIES, url, exc)
-                await asyncio.sleep(1)
-        return {}
+    Removes ?authuser=, hl=, rclk= etc. that can trigger bot detection
+    or return non-English UI that breaks our CSS selectors.
+    """
+    p = urlparse(url)
+    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
 
 def _extract_city_country(location: str) -> tuple[str, str]:
@@ -97,6 +68,66 @@ def _build_record(details: dict, website_status: str, city: str, country: str) -
     return record
 
 
+class BrowserManager:
+    """Holds a Camoufox browser and restarts it on crash."""
+
+    def __init__(self, proxy_url: str | None):
+        self._proxy_url = proxy_url
+        self._cm = None
+        self.browser = None
+        self._lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        proxy = _parse_proxy(self._proxy_url)
+        self._cm = AsyncCamoufox(
+            headless=True,
+            proxy=proxy,
+            geoip=True,
+            firefox_user_prefs={"security.sandbox.content.level": 0},
+        )
+        self.browser = await self._cm.__aenter__()
+
+    async def stop(self) -> None:
+        if self._cm:
+            try:
+                await self._cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._cm = None
+            self.browser = None
+
+    async def restart(self) -> None:
+        async with self._lock:
+            Actor.log.warning("Restarting browser after crash…")
+            await self.stop()
+            await self.start()
+
+
+async def _fetch_one(mgr: BrowserManager, url: str, semaphore: asyncio.Semaphore) -> dict:
+    """Fetch one listing under the semaphore; restarts browser on crash."""
+    clean_url = _clean_maps_url(url)
+    async with semaphore:
+        for attempt in range(1, MAX_RETRIES + 1):
+            page = None
+            try:
+                page = await mgr.browser.new_page()
+                details = await extract_business_details(page, clean_url)
+                return details
+            except Exception as exc:
+                msg = str(exc).lower()
+                Actor.log.warning("Attempt %d/%d failed %s: %s", attempt, MAX_RETRIES, clean_url, exc)
+                if any(kw in msg for kw in ("crashed", "closed", "disconnected", "browser")):
+                    await mgr.restart()
+                await asyncio.sleep(1)
+            finally:
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+        return {}
+
+
 async def main() -> None:
     async with Actor:
         actor_input = await Actor.get_input() or {}
@@ -109,7 +140,6 @@ async def main() -> None:
         if not search_query or not location:
             raise ValueError("Both 'searchQuery' and 'location' are required inputs.")
 
-        # ── Proxy ─────────────────────────────────────────────────────────────
         proxy_cfg = await Actor.create_proxy_configuration(
             actor_proxy_input=actor_input.get("proxyConfiguration"),
         )
@@ -125,71 +155,77 @@ async def main() -> None:
 
         city, country = _extract_city_country(location)
 
-        # ── Open browser ───────────────────────────────────────────────────────
-        browser_cm, browser = await _open_browser(proxy_url)
+        # ── Phase 1: scroll search results for listing URLs ────────────────────
+        mgr = BrowserManager(proxy_url)
+        await mgr.start()
 
         try:
-            # ── Phase 1: collect listing URLs (one scrolling page) ─────────────
-            Actor.log.info("Collecting listing URLs…")
-            listing_urls = await _scroll_search_page(
-                browser, search_url, target=max_results * 3
-            )
-            Actor.log.info("Collected %d listing URLs.", len(listing_urls))
+            scroll_page = await mgr.browser.new_page()
+            try:
+                await scroll_page.goto(search_url, wait_until="load", timeout=60_000)
+                await scroll_page.wait_for_timeout(2_000)
+                html = await scroll_page.content()
+                Actor.log.info("Search page loaded (%d bytes).", len(html))
 
+                Actor.log.info("Collecting listing URLs…")
+                listing_urls = await get_listing_urls(
+                    scroll_page,
+                    max_scroll_attempts=40,
+                    target=max_results * 3,
+                )
+            finally:
+                await scroll_page.close()
+
+            Actor.log.info("Collected %d listing URLs.", len(listing_urls))
             if not listing_urls:
                 Actor.log.warning("No listings found. Check searchQuery and location.")
                 return
 
-            # ── Phase 2: visit listings concurrently ───────────────────────────
-            Actor.log.info(
-                "Visiting listings with concurrency=%d…", CONCURRENCY
-            )
+            # ── Phase 2: concurrent listing visits ─────────────────────────────
+            Actor.log.info("Visiting listings (concurrency=%d)…", CONCURRENCY)
             semaphore = asyncio.Semaphore(CONCURRENCY)
-            tasks = [
-                _fetch_listing(browser, url, semaphore)
-                for url in listing_urls
-            ]
+            tasks = [_fetch_one(mgr, url, semaphore) for url in listing_urls]
             all_details = await asyncio.gather(*tasks)
 
             # ── Phase 3: filter and score ──────────────────────────────────────
             results: list[dict] = []
-            total_filtered = 0
+            count_failed = 0
+            count_has_website = 0
+            count_weak_skipped = 0
 
             for details in all_details:
                 if len(results) >= max_results:
                     break
+
                 if not details or not details.get("businessName"):
+                    count_failed += 1
                     continue
 
                 raw_website = details.pop("websiteUrl", None)
                 website_status = classify_website(raw_website)
 
                 if website_status == "real":
-                    total_filtered += 1
+                    count_has_website += 1
+                    Actor.log.debug("Skipped (real website): %s", details["businessName"])
                     continue
 
                 if website_status in ("social_only", "free_builder", "weak") and not include_weak:
-                    total_filtered += 1
+                    count_weak_skipped += 1
                     continue
 
                 results.append(_build_record(details, website_status, city, country))
 
                 if len(results) % PROGRESS_LOG_EVERY == 0:
-                    Actor.log.info(
-                        "Filtered: %d kept / %d skipped so far.", len(results), total_filtered
-                    )
+                    Actor.log.info("Found %d/%d leads so far.", len(results), max_results)
 
         finally:
-            try:
-                await browser_cm.__aexit__(None, None, None)
-            except Exception:
-                pass
+            await mgr.stop()
 
         results.sort(key=lambda r: r["leadScore"], reverse=True)
 
         Actor.log.info(
-            "Done. %d leads returned (%d filtered out as having real/weak websites).",
-            len(results), total_filtered,
+            "Done: %d leads returned | %d had real websites | %d weak-skipped | %d extraction failed.",
+            len(results), count_has_website, count_weak_skipped, count_failed,
         )
 
         await Actor.push_data(results)
