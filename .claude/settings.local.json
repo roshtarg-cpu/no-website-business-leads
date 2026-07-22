@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(New-Item -ItemType Directory -Force -Path \"C:\\\\Users\\\\91836\\\\Desktop\\\\APIFY ACTORS\\\\NO WEBSITE ACTOR\\\\.actor\")",
+      "PowerShell(New-Item -ItemType Directory -Force -Path \"C:\\\\Users\\\\91836\\\\Desktop\\\\APIFY ACTORS\\\\NO WEBSITE ACTOR\\\\src\")"
+    ]
+  }
+}

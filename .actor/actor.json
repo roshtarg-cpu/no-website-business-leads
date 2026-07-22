@@ -1,8 +1,8 @@
 {
   "actorSpecification": 1,
   "name": "no-website-business-leads",
-  "title": "Find Businesses Without a Website — Lead Scraper for Web Designers & AI Website Agencies",
-  "description": "Scrape businesses with no website from Google Maps in any city worldwide. Returns name, phone, address and lead score. Built for web designers, AI website agencies and anyone selling websites to local businesses. Global coverage.",
+  "title": "No-Website Business Leads — Google Maps Scraper for Web Designers & AI Website Agencies",
+  "description": "Scrape Google Maps for businesses without a website in any city or country. Find web design clients, get phone numbers of businesses with no online presence, and generate leads for your AI website agency or digital marketing consultancy. Returns business name, phone, address, rating and a 1-100 lead score. Detects Facebook-only pages, free Wix sites and Linktree as weak presence. Global coverage — works for any city worldwide, not just USA.",
   "version": "0.1",
   "buildTag": "latest",
   "environmentVariables": {},

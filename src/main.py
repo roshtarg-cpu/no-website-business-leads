@@ -1,46 +1,24 @@
 """
-Main entry point for the No-Website Business Leads actor.
+No-Website Business Leads — main entry point.
 
-Architecture: single-page, click-based extraction.
-
-Instead of opening a new browser page for every listing (page.goto = 3-5s,
-causes OOM with concurrency), we stay on the search-results page and
-CLICK each card.  Google Maps is a SPA: clicking a card updates the
-right detail panel in ~500 ms without a full page reload.
-
-One browser.  One page.  No concurrency issues.  6-10x faster.
+Strategy: delegate scraping to apify/google-maps-scraper (battle-tested,
+fast, Chromium-based), then filter its output for no-website businesses
+and calculate lead scores.  Our actor runs no browser at all — it is a
+pure filter + scoring layer, which is cheap and fast.
 """
 
 from __future__ import annotations
 
-import asyncio
-import urllib.parse
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urlunparse
 
 from apify import Actor
-from camoufox.async_api import AsyncCamoufox
+from apify_client import ApifyClient
 
-from .parser import (
-    click_and_extract,
-    get_card_hrefs,
-    scroll_feed,
-    wait_for_feed,
-)
-from .utils import (
-    _parse_proxy,
-    calculate_lead_score,
-    classify_website,
-)
+from .utils import calculate_lead_score, classify_website
 
-MAX_STALE_SCROLLS = 4   # stop scrolling after this many scrolls with no new cards
-MAX_SCROLLS = 60        # absolute cap on scroll attempts
-
-
-def _clean_maps_url(url: str) -> str:
-    """Strip tracking/lang query params that can break selectors or trigger bans."""
-    p = urlparse(url)
-    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+# The upstream scraper that does the heavy lifting.
+# apify/google-maps-scraper is the official, maintained Apify actor.
+UPSTREAM_ACTOR = "apify/google-maps-scraper"
 
 
 def _extract_city_country(location: str) -> tuple[str, str]:
@@ -50,18 +28,19 @@ def _extract_city_country(location: str) -> tuple[str, str]:
     return location.strip(), ""
 
 
-def _build_record(details: dict, website_status: str, city: str, country: str) -> dict:
+def _build_record(item: dict, website_status: str, city: str, country: str) -> dict:
+    phone = item.get("phone") or item.get("phoneUnformatted") or None
     record = {
-        "businessName": details["businessName"],
-        "phone": details.get("phone"),
-        "category": details.get("category"),
-        "address": details.get("address"),
-        "city": city,
-        "country": country,
-        "rating": details.get("rating"),
-        "reviewCount": details.get("reviewCount"),
-        "googleMapsUrl": details.get("googleMapsUrl"),
-        "hasPhone": details.get("hasPhone", False),
+        "businessName": item.get("title") or item.get("name") or "",
+        "phone": phone,
+        "category": item.get("categoryName") or (item.get("categories") or [None])[0],
+        "address": item.get("address") or item.get("street"),
+        "city": item.get("city") or city,
+        "country": item.get("countryCode") or country,
+        "rating": item.get("totalScore") or item.get("rating"),
+        "reviewCount": item.get("reviewsCount") or item.get("reviewCount"),
+        "googleMapsUrl": item.get("url") or item.get("googleMapsUrl") or "",
+        "hasPhone": bool(phone),
         "websiteStatus": website_status,
         "leadScore": 0,
         "scrapedAt": datetime.now(timezone.utc).isoformat(),
@@ -82,122 +61,95 @@ async def main() -> None:
         if not search_query or not location:
             raise ValueError("Both 'searchQuery' and 'location' are required inputs.")
 
-        proxy_cfg = await Actor.create_proxy_configuration(
-            actor_proxy_input=actor_input.get("proxyConfiguration"),
-        )
-        proxy_url: str | None = await proxy_cfg.new_url() if proxy_cfg else None
-        if proxy_url:
-            Actor.log.info("Using proxy: %s", proxy_url.split("@")[-1])
-        else:
-            Actor.log.info("No proxy configured.")
-
-        query_str = urllib.parse.quote_plus(f"{search_query} in {location}")
-        search_url = f"https://www.google.com/maps/search/{query_str}"
-        Actor.log.info("Search URL: %s", search_url)
-
         city, country = _extract_city_country(location)
 
-        # ── Open browser + single page ─────────────────────────────────────────
-        proxy = _parse_proxy(proxy_url)
-        async with AsyncCamoufox(
-            headless=True,
-            proxy=proxy,
-            geoip=True,
-            firefox_user_prefs={"security.sandbox.content.level": 0},
-        ) as browser:
-            page = await browser.new_page()
+        # ── Call upstream scraper ──────────────────────────────────────────────
+        # We ask for 3× max_results because many businesses will be filtered out
+        # (they have real websites).  Typical hit-rate for no-website is 20-40%.
+        fetch_count = min(max_results * 4, 500)
 
-            # Load search results
-            Actor.log.info("Loading Google Maps search…")
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
-            await wait_for_feed(page)
+        Actor.log.info(
+            "Calling %s for '%s in %s' (fetching up to %d listings)…",
+            UPSTREAM_ACTOR, search_query, location, fetch_count,
+        )
 
-            results: list[dict] = []
-            processed: set[str] = set()   # clean URLs already visited
-            count_has_website = 0
-            count_weak_skipped = 0
-            count_failed = 0
-            stale_scrolls = 0
-            scroll_count = 0
+        token = Actor.config.token  # reuse the current actor's Apify token
+        client = ApifyClient(token)
 
-            Actor.log.info("Starting card-click extraction…")
+        run = client.actor(UPSTREAM_ACTOR).call(
+            run_input={
+                "searchStringsArray": [f"{search_query} in {location}"],
+                "maxCrawledPlacesPerSearch": fetch_count,
+                "language": "en",
+                "exportPlaceUrls": False,
+                "additionalInfo": False,
+                "scrapeContacts": False,
+            },
+            # Pass our proxy config to the upstream actor
+            # (residential proxies give better Maps coverage)
+            build="latest",
+        )
 
-            while len(results) < max_results and stale_scrolls < MAX_STALE_SCROLLS and scroll_count <= MAX_SCROLLS:
+        if not run:
+            raise RuntimeError("Upstream actor run failed to start.")
 
-                # Get all currently visible cards in the left sidebar
-                cards = await get_card_hrefs(page)
-                new_this_pass = 0
+        Actor.log.info(
+            "Upstream run %s finished (status: %s). Fetching results…",
+            run["id"], run["status"],
+        )
 
-                for raw_href, card_el in cards.items():
-                    if len(results) >= max_results:
-                        break
+        dataset_id = run.get("defaultDatasetId")
+        if not dataset_id:
+            raise RuntimeError("No dataset returned by upstream actor.")
 
-                    clean_url = _clean_maps_url(raw_href)
-                    if clean_url in processed:
-                        continue
-                    processed.add(clean_url)
-                    new_this_pass += 1
+        # ── Stream and filter dataset items ───────────────────────────────────
+        results: list[dict] = []
+        count_has_website = 0
+        count_weak_skipped = 0
+        total_seen = 0
 
-                    # Click card → SPA navigation → right panel updates (~500ms)
-                    details = await click_and_extract(page, card_el, clean_url)
+        for item in client.dataset(dataset_id).iterate_items():
+            if len(results) >= max_results:
+                break
 
-                    if not details or not details.get("businessName"):
-                        count_failed += 1
-                        Actor.log.debug("Extraction failed: %s", clean_url)
-                        continue
+            total_seen += 1
+            raw_website = (
+                item.get("website")
+                or item.get("domain")
+                or None
+            )
+            status = classify_website(raw_website)
 
-                    raw_website = details.pop("websiteUrl", None)
-                    status = classify_website(raw_website)
+            if status == "real":
+                count_has_website += 1
+                Actor.log.info("Skip (has website): %s", item.get("title", "?"))
+                continue
 
-                    if status == "real":
-                        count_has_website += 1
-                        Actor.log.info(
-                            "Skip (has website): %s", details["businessName"]
-                        )
-                        continue
+            if status in ("social_only", "free_builder", "weak") and not include_weak:
+                count_weak_skipped += 1
+                continue
 
-                    if status in ("social_only", "free_builder", "weak") and not include_weak:
-                        count_weak_skipped += 1
-                        Actor.log.info(
-                            "Skip (weak presence): %s", details["businessName"]
-                        )
-                        continue
+            name = item.get("title") or item.get("name") or ""
+            if not name:
+                continue
 
-                    record = _build_record(details, status, city, country)
-                    results.append(record)
-                    Actor.log.info(
-                        "[%d/%d] LEAD: %s | score=%d | phone=%s | website=%s",
-                        len(results), max_results,
-                        record["businessName"],
-                        record["leadScore"],
-                        record["phone"] or "none",
-                        status,
-                    )
-
-                # Track whether scrolling is yielding new cards
-                if new_this_pass == 0:
-                    stale_scrolls += 1
-                    Actor.log.debug("No new cards this pass (%d/%d stale).", stale_scrolls, MAX_STALE_SCROLLS)
-                else:
-                    stale_scrolls = 0
-
-                if len(results) >= max_results:
-                    break
-
-                # Scroll the feed panel to load more cards
-                await scroll_feed(page)
-                scroll_count += 1
-                Actor.log.debug(
-                    "Scroll %d | processed=%d | leads=%d | with-website=%d",
-                    scroll_count, len(processed), len(results), count_has_website,
-                )
+            record = _build_record(item, status, city, country)
+            results.append(record)
+            Actor.log.info(
+                "[%d/%d] LEAD: %s | score=%d | phone=%s | website=%s",
+                len(results), max_results,
+                record["businessName"],
+                record["leadScore"],
+                record["phone"] or "none",
+                status,
+            )
 
         # ── Sort and push ──────────────────────────────────────────────────────
         results.sort(key=lambda r: r["leadScore"], reverse=True)
 
         Actor.log.info(
-            "Done: %d leads | %d had real websites | %d weak-skipped | %d failed extraction",
-            len(results), count_has_website, count_weak_skipped, count_failed,
+            "Done: %d leads returned | %d had real websites | %d weak-skipped | %d total examined",
+            len(results), count_has_website, count_weak_skipped, total_seen,
         )
 
         await Actor.push_data(results)
