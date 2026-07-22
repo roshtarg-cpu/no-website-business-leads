@@ -9,10 +9,11 @@ pure filter + scoring layer, which is cheap and fast.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 from apify import Actor
-from apify_client import ApifyClient
+from apify_client import ApifyClientAsync
 
 from .utils import calculate_lead_score, classify_website
 
@@ -73,10 +74,14 @@ async def main() -> None:
             UPSTREAM_ACTOR, search_query, location, fetch_count,
         )
 
-        token = Actor.config.token  # reuse the current actor's Apify token
-        client = ApifyClient(token)
+        # APIFY_TOKEN is always set by the platform when an actor runs
+        token = os.environ.get("APIFY_TOKEN") or os.environ.get("APIFY_API_TOKEN")
+        if not token:
+            raise RuntimeError("APIFY_TOKEN environment variable not set.")
 
-        run = client.actor(UPSTREAM_ACTOR).call(
+        client = ApifyClientAsync(token)
+
+        run = await client.actor(UPSTREAM_ACTOR).call(
             run_input={
                 "searchStringsArray": [f"{search_query} in {location}"],
                 "maxCrawledPlacesPerSearch": fetch_count,
@@ -85,8 +90,6 @@ async def main() -> None:
                 "additionalInfo": False,
                 "scrapeContacts": False,
             },
-            # Pass our proxy config to the upstream actor
-            # (residential proxies give better Maps coverage)
             build="latest",
         )
 
@@ -108,7 +111,7 @@ async def main() -> None:
         count_weak_skipped = 0
         total_seen = 0
 
-        for item in client.dataset(dataset_id).iterate_items():
+        async for item in client.dataset(dataset_id).iterate_items():
             if len(results) >= max_results:
                 break
 
