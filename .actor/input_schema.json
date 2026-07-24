@@ -7,19 +7,21 @@
       "title": "Business Type",
       "type": "string",
       "description": "Type of business to find that needs a website e.g. restaurants, plumbers, dentists, salons, contractors",
-      "editor": "textfield"
+      "editor": "textfield",
+      "prefill": "restaurants"
     },
     "location": {
       "title": "Location",
       "type": "string",
       "description": "City and country to find businesses without websites e.g. London UK, New York USA, Dubai UAE, Mumbai India",
-      "editor": "textfield"
+      "editor": "textfield",
+      "prefill": "London UK"
     },
     "maxResults": {
       "title": "Max Results",
       "type": "integer",
       "description": "Maximum number of no-website businesses to return",
-      "default": 100,
+      "default": 10,
       "editor": "number"
     },
     "includeWeakWebsite": {
